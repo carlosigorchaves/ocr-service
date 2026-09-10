@@ -6,9 +6,8 @@ const { promisify } = require('util')
 const fs        = require('fs')
 const path      = require('path')
 const os        = require('os')
-const fetch     = require('node-fetch')
 const FormData  = require('form-data')
-const { createClient } = require('@supabase/supabase-js')
+const XLSX      = require('xlsx')
 
 const execAsync = promisify(exec)
 const app       = express()
@@ -17,13 +16,8 @@ const upload    = multer({ dest: os.tmpdir() })
 const PORT             = process.env.PORT || 3002
 const AUTENTIQUE_TOKEN = process.env.AUTENTIQUE_API_TOKEN
 const SANDBOX          = process.env.AUTENTIQUE_SANDBOX !== 'false'
-const SUPABASE_URL     = process.env.NEXT_PUBLIC_SUPABASE_URL
-const SUPABASE_KEY     = process.env.SUPABASE_SERVICE_ROLE_KEY
 const OCR_SECRET       = process.env.OCR_SECRET || ''
 
-function sb() { return createClient(SUPABASE_URL, SUPABASE_KEY) }
-
-// Autenticação por secret
 app.use((req, res, next) => {
   if (req.path === '/health') return next()
   const secret = req.headers['x-ocr-secret']
@@ -32,31 +26,53 @@ app.use((req, res, next) => {
 })
 
 app.use(express.json())
-
-// Health check
 app.get('/health', (req, res) => res.json({ ok: true, sandbox: SANDBOX }))
 
-// Processar PDF com OCR
-app.post('/processar', upload.single('pdf'), async (req, res) => {
-  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ocr_'))
+function lerExcel(buffer) {
+  const wb   = XLSX.read(buffer, { type: 'buffer' })
+  const ws   = wb.Sheets[wb.SheetNames[0]]
+  const rows = XLSX.utils.sheet_to_json(ws, { defval: '' })
+  const mapa = {}
+  const normK = k => String(k).toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g,'').trim()
+  rows.forEach(row => {
+    const c = {}
+    for (const [k, v] of Object.entries(row)) {
+      const nk = normK(k)
+      if (['nome','email','matricula','cpf','cargo'].includes(nk)) c[nk] = String(v).trim()
+    }
+    const chave = c.matricula || c.cpf
+    if (chave && c.email && c.email.includes('@')) {
+      mapa[chave] = { nome: c.nome || '', email: c.email, cargo: c.cargo || '' }
+    }
+  })
+  return mapa
+}
 
+app.post('/processar', upload.fields([
+  { name: 'pdf',   maxCount: 1 },
+  { name: 'excel', maxCount: 1 },
+]), async (req, res) => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ocr_'))
   try {
-    if (!req.file) return res.status(400).json({ erro: 'PDF obrigatório.' })
+    if (!req.files?.pdf)   return res.status(400).json({ erro: 'PDF obrigatório.' })
+    if (!req.files?.excel) return res.status(400).json({ erro: 'Planilha Excel obrigatória.' })
 
     const nomeDoc  = req.body.nomeDocumento || 'Contracheque'
     const mensagem = req.body.mensagem || ''
-    const pdfPath  = req.file.path
+    const pdfPath  = req.files.pdf[0].path
 
-    // Conta páginas
+    const excelBuf      = fs.readFileSync(req.files.excel[0].path)
+    const colaboradores = lerExcel(excelBuf)
+    console.log(`[excel] ${Object.keys(colaboradores).length} colaboradores`)
+
     const { stdout: infoOut } = await execAsync(`pdfinfo "${pdfPath}"`)
     const pagesMatch   = infoOut.match(/Pages:\s+(\d+)/)
     const totalPaginas = pagesMatch ? parseInt(pagesMatch[1]) : 0
     if (!totalPaginas) return res.status(400).json({ erro: 'Não foi possível ler o PDF.' })
 
     console.log(`[ocr] processando ${totalPaginas} páginas...`)
-
-    // Fase 1: OCR — agrupa páginas por colaborador
     const mapa = {}
+
     for (let pg = 1; pg <= totalPaginas; pg++) {
       const imgPrefix = path.join(tmpDir, 'pg')
       await execAsync(`pdftoppm -jpeg -r 200 -f ${pg} -l ${pg} "${pdfPath}" "${imgPrefix}"`)
@@ -67,112 +83,72 @@ app.post('/processar', upload.single('pdf'), async (req, res) => {
         const { stdout } = await execAsync(`python3 ${path.join(__dirname, 'ocr.py')} "${imgPath}"`)
         const output = stdout.trim()
         if (output && output !== 'NAO_IDENTIFICADO' && output.includes('||')) {
-          const [matricula, nome] = output.split('||')
-          const chave = `${matricula.trim()}|${nome.trim()}`
-          if (!mapa[chave]) mapa[chave] = { matricula: matricula.trim(), nome: nome.trim(), paginas: [] }
+          const [matricula, nomeOCR] = output.split('||')
+          const chave = matricula.trim()
+          if (!mapa[chave]) mapa[chave] = { matricula: chave, nomeOCR: nomeOCR.trim(), paginas: [] }
           mapa[chave].paginas.push(pg)
-        } else {
-          console.log(`[ocr] página ${pg} não identificada`)
         }
       } catch (err) { console.error(`[ocr] erro página ${pg}:`, err.message) }
       try { fs.unlinkSync(imgPath) } catch {}
     }
 
-    const colaboradores = Object.values(mapa)
-    console.log(`[ocr] ${colaboradores.length} colaboradores identificados`)
-    if (!colaboradores.length) return res.status(400).json({ erro: 'Nenhum colaborador identificado.' })
+    const itens = Object.values(mapa)
+    console.log(`[ocr] ${itens.length} identificados`)
+    if (!itens.length) return res.status(400).json({ erro: 'Nenhum colaborador identificado pelo OCR.' })
 
-    // Fase 2: Separa PDFs e envia para Autentique
     const loteId     = 'lote_ocr_' + Date.now()
     const resultados = []
 
-    for (const col of colaboradores) {
+    for (const item of itens) {
       try {
-        // Separa PDF individual
-        const paginasStr   = col.paginas.join(' ')
-        const pdfIndivPath = path.join(tmpDir, `${col.matricula}.pdf`)
+        const dadosExcel = colaboradores[item.matricula]
+        if (!dadosExcel) {
+          resultados.push({ matricula: item.matricula, nome: item.nomeOCR, ok: false, erro: 'Matrícula não encontrada na planilha' })
+          continue
+        }
+        const paginasStr   = item.paginas.join(' ')
+        const pdfIndivPath = path.join(tmpDir, `${item.matricula}.pdf`)
         await execAsync(`pdftk "${pdfPath}" cat ${paginasStr} output "${pdfIndivPath}"`)
         const pdfBuf = fs.readFileSync(pdfIndivPath)
 
-        // Busca por matrícula no Supabase
-        let encontrado = null
-        const { data: r1 } = await sb().from('colaboradores')
-          .select('id, email, nome').eq('matricula', col.matricula).limit(1)
-        if (r1?.length) {
-          encontrado = r1[0]
-        } else {
-          // fallback: busca pelo CPF
-          const { data: r2 } = await sb().from('colaboradores')
-            .select('id, email, nome').eq('cpf', col.matricula).limit(1)
-          if (r2?.length) encontrado = r2[0]
-        }
-
-        const email    = encontrado?.email || null
-        const nomeReal = encontrado?.nome   || col.nome
-
-        if (!email) {
-          console.log(`[aviso] matrícula ${col.matricula} sem email`)
-          resultados.push({ matricula: col.matricula, nome: col.nome, ok: false, erro: 'Matrícula não encontrada no sistema' })
-          continue
-        }
-
-        // Registra envio no Supabase
-        const { data: inserted } = await sb().from('colaboradores').insert({
-          lote_id:   loteId,
-          nome:      nomeReal,
-          email,
-          matricula: col.matricula,
-          status:    'pendente',
-          extras:    { paginas: col.paginas },
-        }).select().single()
-
-        // Envia para Autentique
         const doc = await criarDocumento({
-          nome:            `${nomeDoc} - ${nomeReal}`,
+          nome:            `${nomeDoc} - ${dadosExcel.nome || item.nomeOCR}`,
           pdfBuf,
-          pdfNome:         `${col.matricula}.pdf`,
-          email,
-          nomeColaborador: nomeReal,
+          pdfNome:         `${item.matricula}.pdf`,
+          email:           dadosExcel.email,
+          nomeColaborador: dadosExcel.nome || item.nomeOCR,
           mensagem,
         })
-
         const sig = doc.signatures?.[0]
-        await sb().from('colaboradores').update({
-          document_id:         doc.id,
-          signature_public_id: sig?.public_id || null,
-          link_assinatura:     sig?.link?.short_link || null,
-          status:              'enviado',
-          enviado_em:          new Date().toISOString(),
-        }).eq('id', inserted.id)
-
-        resultados.push({ matricula: col.matricula, nome: nomeReal, email, ok: true, documentId: doc.id })
-        console.log(`[ok] ${nomeReal} <${email}> → ${doc.id}`)
+        resultados.push({ matricula: item.matricula, nome: dadosExcel.nome, email: dadosExcel.email, ok: true, documentId: doc.id, linkAssinatura: sig?.link?.short_link })
+        console.log(`[ok] ${dadosExcel.nome} <${dadosExcel.email}> → ${doc.id}`)
         await new Promise(r => setTimeout(r, 1100))
       } catch (err) {
-        console.error(`[erro] ${col.matricula}: ${err.message}`)
-        resultados.push({ matricula: col.matricula, nome: col.nome, ok: false, erro: err.message })
+        console.error(`[erro] ${item.matricula}: ${err.message}`)
+        resultados.push({ matricula: item.matricula, nome: item.nomeOCR, ok: false, erro: err.message })
       }
     }
 
     const enviados = resultados.filter(r => r.ok).length
     res.json({
       ok: true, loteId, totalPaginas,
-      colaboradoresIdentificados: colaboradores.length,
+      colaboradoresIdentificados: itens.length,
       enviados,
       semMatricula: resultados.filter(r => !r.ok && r.erro?.includes('não encontrada')).length,
       erros:        resultados.filter(r => !r.ok && !r.erro?.includes('não encontrada')).length,
-      sandbox:      SANDBOX,
-      resultados,
+      sandbox: SANDBOX, resultados,
     })
   } catch (err) {
     console.error('[processar]', err)
     res.status(500).json({ erro: err.message })
   } finally {
     try { fs.rmSync(tmpDir, { recursive: true }) } catch {}
-    try { fs.unlinkSync(req.file?.path) } catch {}
+    try { fs.unlinkSync(req.files?.pdf?.[0]?.path) } catch {}
+    try { fs.unlinkSync(req.files?.excel?.[0]?.path) } catch {}
   }
 })
 
+// Usa fetch nativo do Node 20 para chamar a Autentique
 async function criarDocumento({ nome, pdfBuf, pdfNome, email, nomeColaborador, mensagem }) {
   const query = `
     mutation CreateDocumentMutation($document: DocumentInput!, $signers: [SignerInput!]!, $file: Upload!) {
@@ -186,16 +162,27 @@ async function criarDocumento({ nome, pdfBuf, pdfNome, email, nomeColaborador, m
     signers:  [{ email, name: nomeColaborador, action: 'SIGN' }],
     file: null,
   }
+
+  // Usa form-data nativo para multipart
   const form = new FormData()
   form.append('operations', JSON.stringify({ query, variables }))
   form.append('map', JSON.stringify({ file: ['variables.file'] }))
   form.append('file', pdfBuf, { filename: pdfNome, contentType: 'application/pdf' })
 
-  const res  = await fetch('https://api.autentique.com.br/v2/graphql', {
+  // Usa o fetch nativo do Node 20 (sem node-fetch)
+  const { Readable } = require('stream')
+
+  const res = await fetch('https://api.autentique.com.br/v2/graphql', {
     method:  'POST',
-    headers: { Authorization: `Bearer ${AUTENTIQUE_TOKEN}`, ...form.getHeaders() },
-    body:    form,
+    headers: {
+      Authorization: `Bearer ${AUTENTIQUE_TOKEN}`,
+      ...form.getHeaders(),
+    },
+    body: form,
+    // Node 20 precisa desse duplex para streams
+    duplex: 'half',
   })
+
   const json = await res.json()
   if (json.errors) throw new Error(json.errors[0]?.message || JSON.stringify(json.errors))
   return json.data.createDocument
