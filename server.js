@@ -9,7 +9,7 @@ const os           = require('os')
 const FormData     = require('form-data')
 const XLSX         = require('xlsx')
 const https        = require('https')
-const http         = require('http') 
+const { createClient } = require('@supabase/supabase-js')
 
 const execAsync = promisify(exec)
 const app       = express()
@@ -19,6 +19,10 @@ const PORT             = process.env.PORT || 3002
 const AUTENTIQUE_TOKEN = process.env.AUTENTIQUE_API_TOKEN
 const SANDBOX          = process.env.AUTENTIQUE_SANDBOX !== 'false'
 const OCR_SECRET       = process.env.OCR_SECRET || ''
+const SUPABASE_URL     = process.env.NEXT_PUBLIC_SUPABASE_URL
+const SUPABASE_KEY     = process.env.SUPABASE_SERVICE_ROLE_KEY
+
+function sb() { return createClient(SUPABASE_URL, SUPABASE_KEY) }
 
 app.use((req, res, next) => {
   if (req.path === '/health') return next()
@@ -50,11 +54,9 @@ function lerExcel(buffer) {
   return mapa
 }
 
-// Requisição HTTP nativa (sem node-fetch)
 function httpRequest(url, options, body) {
   return new Promise((resolve, reject) => {
-    const lib     = url.startsWith('https') ? https : http
-    const req     = lib.request(url, options, res => {
+    const req = https.request(url, options, res => {
       let data = ''
       res.on('data', chunk => data += chunk)
       res.on('end', () => {
@@ -76,26 +78,19 @@ async function criarDocumento({ nome, pdfBuf, pdfNome, email, nomeColaborador, m
         signatures { public_id name email action { name } link { short_link } }
       }
     }`
-
   const variables = {
     document: { name: nome, ...(mensagem ? { message: mensagem } : {}) },
     signers:  [{ email, name: nomeColaborador, action: 'SIGN' }],
     file: null,
   }
-
   const form = new FormData()
   form.append('operations', JSON.stringify({ query, variables }))
   form.append('map', JSON.stringify({ file: ['variables.file'] }))
   form.append('file', pdfBuf, { filename: pdfNome, contentType: 'application/pdf' })
 
-  const headers = {
-    Authorization: `Bearer ${AUTENTIQUE_TOKEN}`,
-    ...form.getHeaders(),
-  }
-
   const json = await httpRequest('https://api.autentique.com.br/v2/graphql', {
     method: 'POST',
-    headers,
+    headers: { Authorization: `Bearer ${AUTENTIQUE_TOKEN}`, ...form.getHeaders() },
   }, form)
 
   if (json.errors) throw new Error(json.errors[0]?.message || JSON.stringify(json.errors))
@@ -176,6 +171,24 @@ app.post('/processar', upload.fields([
         })
 
         const sig = doc.signatures?.[0]
+
+        // Salva no Supabase para o acompanhamento funcionar
+        if (SUPABASE_URL && SUPABASE_KEY) {
+          const { data: inserted } = await sb().from('colaboradores').insert({
+            lote_id:             loteId,
+            nome:                dadosExcel.nome || item.nomeOCR,
+            email:               dadosExcel.email,
+            matricula:           item.matricula,
+            cargo:               dadosExcel.cargo || '',
+            status:              'enviado',
+            enviado_em:          new Date().toISOString(),
+            document_id:         doc.id,
+            signature_public_id: sig?.public_id || null,
+            link_assinatura:     sig?.link?.short_link || null,
+          }).select().single()
+          if (inserted) console.log(`[supabase] salvo id=${inserted.id}`)
+        }
+
         resultados.push({
           matricula:      item.matricula,
           nome:           dadosExcel.nome,
