@@ -1,13 +1,15 @@
 require('dotenv').config()
-const express   = require('express')
-const multer    = require('multer')
-const { exec }  = require('child_process')
-const { promisify } = require('util')
-const fs        = require('fs')
-const path      = require('path')
-const os        = require('os')
-const FormData  = require('form-data')
-const XLSX      = require('xlsx')
+const express      = require('express')
+const multer       = require('multer')
+const { exec }     = require('child_process')
+const { promisify }= require('util')
+const fs           = require('fs')
+const path         = require('path')
+const os           = require('os')
+const FormData     = require('form-data')
+const XLSX         = require('xlsx')
+const https        = require('https')
+const http         = require('http')
 
 const execAsync = promisify(exec)
 const app       = express()
@@ -29,10 +31,10 @@ app.use(express.json())
 app.get('/health', (req, res) => res.json({ ok: true, sandbox: SANDBOX }))
 
 function lerExcel(buffer) {
-  const wb   = XLSX.read(buffer, { type: 'buffer' })
-  const ws   = wb.Sheets[wb.SheetNames[0]]
-  const rows = XLSX.utils.sheet_to_json(ws, { defval: '' })
-  const mapa = {}
+  const wb    = XLSX.read(buffer, { type: 'buffer' })
+  const ws    = wb.Sheets[wb.SheetNames[0]]
+  const rows  = XLSX.utils.sheet_to_json(ws, { defval: '' })
+  const mapa  = {}
   const normK = k => String(k).toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g,'').trim()
   rows.forEach(row => {
     const c = {}
@@ -46,6 +48,58 @@ function lerExcel(buffer) {
     }
   })
   return mapa
+}
+
+// Requisição HTTP nativa (sem node-fetch)
+function httpRequest(url, options, body) {
+  return new Promise((resolve, reject) => {
+    const lib     = url.startsWith('https') ? https : http
+    const req     = lib.request(url, options, res => {
+      let data = ''
+      res.on('data', chunk => data += chunk)
+      res.on('end', () => {
+        try { resolve(JSON.parse(data)) }
+        catch { reject(new Error('Resposta inválida: ' + data.slice(0, 200))) }
+      })
+    })
+    req.on('error', reject)
+    if (body) body.pipe(req)
+    else req.end()
+  })
+}
+
+async function criarDocumento({ nome, pdfBuf, pdfNome, email, nomeColaborador, mensagem }) {
+  const query = `
+    mutation CreateDocumentMutation($document: DocumentInput!, $signers: [SignerInput!]!, $file: Upload!) {
+      createDocument(sandbox: ${SANDBOX}, document: $document, signers: $signers, file: $file) {
+        id name created_at
+        signatures { public_id name email action { name } link { short_link } }
+      }
+    }`
+
+  const variables = {
+    document: { name: nome, ...(mensagem ? { message: mensagem } : {}) },
+    signers:  [{ email, name: nomeColaborador, action: 'SIGN' }],
+    file: null,
+  }
+
+  const form = new FormData()
+  form.append('operations', JSON.stringify({ query, variables }))
+  form.append('map', JSON.stringify({ file: ['variables.file'] }))
+  form.append('file', pdfBuf, { filename: pdfNome, contentType: 'application/pdf' })
+
+  const headers = {
+    Authorization: `Bearer ${AUTENTIQUE_TOKEN}`,
+    ...form.getHeaders(),
+  }
+
+  const json = await httpRequest('https://api.autentique.com.br/v2/graphql', {
+    method: 'POST',
+    headers,
+  }, form)
+
+  if (json.errors) throw new Error(json.errors[0]?.message || JSON.stringify(json.errors))
+  return json.data.createDocument
 }
 
 app.post('/processar', upload.fields([
@@ -106,6 +160,7 @@ app.post('/processar', upload.fields([
           resultados.push({ matricula: item.matricula, nome: item.nomeOCR, ok: false, erro: 'Matrícula não encontrada na planilha' })
           continue
         }
+
         const paginasStr   = item.paginas.join(' ')
         const pdfIndivPath = path.join(tmpDir, `${item.matricula}.pdf`)
         await execAsync(`pdftk "${pdfPath}" cat ${paginasStr} output "${pdfIndivPath}"`)
@@ -119,8 +174,16 @@ app.post('/processar', upload.fields([
           nomeColaborador: dadosExcel.nome || item.nomeOCR,
           mensagem,
         })
+
         const sig = doc.signatures?.[0]
-        resultados.push({ matricula: item.matricula, nome: dadosExcel.nome, email: dadosExcel.email, ok: true, documentId: doc.id, linkAssinatura: sig?.link?.short_link })
+        resultados.push({
+          matricula:      item.matricula,
+          nome:           dadosExcel.nome,
+          email:          dadosExcel.email,
+          ok:             true,
+          documentId:     doc.id,
+          linkAssinatura: sig?.link?.short_link,
+        })
         console.log(`[ok] ${dadosExcel.nome} <${dadosExcel.email}> → ${doc.id}`)
         await new Promise(r => setTimeout(r, 1100))
       } catch (err) {
@@ -136,7 +199,8 @@ app.post('/processar', upload.fields([
       enviados,
       semMatricula: resultados.filter(r => !r.ok && r.erro?.includes('não encontrada')).length,
       erros:        resultados.filter(r => !r.ok && !r.erro?.includes('não encontrada')).length,
-      sandbox: SANDBOX, resultados,
+      sandbox:      SANDBOX,
+      resultados,
     })
   } catch (err) {
     console.error('[processar]', err)
@@ -147,45 +211,5 @@ app.post('/processar', upload.fields([
     try { fs.unlinkSync(req.files?.excel?.[0]?.path) } catch {}
   }
 })
-
-// Usa fetch nativo do Node 20 para chamar a Autentique
-async function criarDocumento({ nome, pdfBuf, pdfNome, email, nomeColaborador, mensagem }) {
-  const query = `
-    mutation CreateDocumentMutation($document: DocumentInput!, $signers: [SignerInput!]!, $file: Upload!) {
-      createDocument(sandbox: ${SANDBOX}, document: $document, signers: $signers, file: $file) {
-        id name created_at
-        signatures { public_id name email action { name } link { short_link } }
-      }
-    }`
-  const variables = {
-    document: { name: nome, ...(mensagem ? { message: mensagem } : {}) },
-    signers:  [{ email, name: nomeColaborador, action: 'SIGN' }],
-    file: null,
-  }
-
-  // Usa form-data nativo para multipart
-  const form = new FormData()
-  form.append('operations', JSON.stringify({ query, variables }))
-  form.append('map', JSON.stringify({ file: ['variables.file'] }))
-  form.append('file', pdfBuf, { filename: pdfNome, contentType: 'application/pdf' })
-
-  // Usa o fetch nativo do Node 20 (sem node-fetch)
-  const { Readable } = require('stream')
-
-  const res = await fetch('https://api.autentique.com.br/v2/graphql', {
-    method:  'POST',
-    headers: {
-      Authorization: `Bearer ${AUTENTIQUE_TOKEN}`,
-      ...form.getHeaders(),
-    },
-    body: form,
-    // Node 20 precisa desse duplex para streams
-    duplex: 'half',
-  })
-
-  const json = await res.json()
-  if (json.errors) throw new Error(json.errors[0]?.message || JSON.stringify(json.errors))
-  return json.data.createDocument
-}
 
 app.listen(PORT, () => console.log(`OCR Service na porta ${PORT} | Sandbox: ${SANDBOX}`))
