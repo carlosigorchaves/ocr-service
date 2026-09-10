@@ -8,6 +8,7 @@
     "form-data": "^4.0.0",
     "dotenv": "^16.4.5",
     "xlsx": "^0.18.5",
-    "@supabase/supabase-js": "^2.43.4"
+    "@supabase/supabase-js": "^2.43.4",
+    "ws": "^8.18.0"
   }
 }
