@@ -10,6 +10,7 @@ const FormData     = require('form-data')
 const XLSX         = require('xlsx')
 const https        = require('https')
 const { createClient } = require('@supabase/supabase-js')
+const ws = require('ws')
 
 const execAsync = promisify(exec)
 const app       = express()
@@ -22,7 +23,12 @@ const OCR_SECRET       = process.env.OCR_SECRET || ''
 const SUPABASE_URL     = process.env.NEXT_PUBLIC_SUPABASE_URL
 const SUPABASE_KEY     = process.env.SUPABASE_SERVICE_ROLE_KEY
 
-function sb() { return createClient(SUPABASE_URL, SUPABASE_KEY) }
+function sb() {
+  return createClient(SUPABASE_URL, SUPABASE_KEY, {
+    global: { fetch: fetch },
+    realtime: { transport: ws },
+  })
+}
 
 app.use((req, res, next) => {
   if (req.path === '/health') return next()
