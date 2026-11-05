@@ -262,4 +262,100 @@ app.post('/processar', upload.fields([
   }
 })
 
+// ---------- ENVIO PADRÃO: 1 PDF igual para todos os colaboradores da planilha ----------
+function lerExcelLista(buffer) {
+  const wb   = XLSX.read(buffer, { type: 'buffer' })
+  const sh   = wb.Sheets[wb.SheetNames[0]]
+  const rows = XLSX.utils.sheet_to_json(sh, { defval: '' })
+  const CAMPOS = ['nome','email','cpf','matricula','cargo','centro_custo','situacao']
+  const normK  = k => String(k).toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g,'').replace(/[\s-]+/g,'_').trim()
+  return rows.map(row => {
+    const c = {}, extras = {}
+    for (const [k, v] of Object.entries(row)) {
+      const nk = normK(k)
+      if (CAMPOS.includes(nk)) c[nk] = String(v).trim()
+      else if (String(v).trim() !== '') extras[k] = String(v).trim()
+    }
+    const sit = String(c.situacao || 'ativo').toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g,'')
+    c.situacao = /demit|inativ|desat/.test(sit) ? 'demitido' : 'ativo'
+    c.extras = extras
+    return c
+  })
+}
+
+app.post('/enviar-padrao', upload.fields([
+  { name: 'pdf',   maxCount: 1 },
+  { name: 'excel', maxCount: 1 },
+]), async (req, res) => {
+  try {
+    if (!req.files?.pdf)   return res.status(400).json({ erro: 'PDF obrigatório.' })
+    if (!req.files?.excel) return res.status(400).json({ erro: 'Planilha Excel obrigatória.' })
+
+    const nomeDoc  = req.body.nomeDocumento || 'Documento para assinatura'
+    const mensagem = req.body.mensagem || ''
+    const pdfNome  = req.files.pdf[0].originalname || 'documento.pdf'
+    const pdfBuf   = fs.readFileSync(req.files.pdf[0].path)
+
+    const todos = lerExcelLista(fs.readFileSync(req.files.excel[0].path))
+    const validos = todos.filter(c => c.email && c.email.includes('@') && c.nome && c.matricula)
+    const ignoradas = todos.length - validos.length
+    if (!validos.length) {
+      return res.status(400).json({ erro: 'Nenhum colaborador válido na planilha. Colunas obrigatórias: nome, email e matricula.' })
+    }
+
+    const loteId = 'lote_' + Date.now()
+    const resultados = []
+
+    for (let i = 0; i < validos.length; i++) {
+      const col = validos[i]
+      const base = {
+        lote_id: loteId, nome: col.nome, email: col.email, cpf: col.cpf || null,
+        matricula: col.matricula, cargo: col.cargo || null, centro_custo: col.centro_custo || null,
+        situacao: col.situacao, extras: Object.keys(col.extras).length ? col.extras : null,
+      }
+      if (col.situacao === 'demitido') {
+        await sb().from('colaboradores').insert({ ...base, status: 'pendente' })
+        resultados.push({ email: col.email, ok: false, erro: 'Colaborador demitido — ignorado' })
+        continue
+      }
+      try {
+        const doc = await criarDocumento({
+          nome: `${nomeDoc} - ${col.nome}`, pdfBuf, pdfNome,
+          email: col.email, nomeColaborador: col.nome, mensagem,
+        })
+        const sig = doc.signatures?.[0]
+        await sb().from('colaboradores').insert({
+          ...base, status: 'enviado', enviado_em: new Date().toISOString(),
+          document_id: doc.id, signature_public_id: sig?.public_id || null,
+          link_assinatura: sig?.link?.short_link || null,
+        })
+        resultados.push({ email: col.email, ok: true, documentId: doc.id })
+        console.log(`[padrao ok] ${col.nome} <${col.email}>`)
+      } catch (err) {
+        console.error(`[padrao erro] ${col.email}: ${err.message}`)
+        await sb().from('colaboradores').insert({ ...base, status: 'pendente' })
+        resultados.push({ email: col.email, ok: false, erro: err.message })
+      }
+      if (i < validos.length - 1) await new Promise(r => setTimeout(r, 1100))
+    }
+
+    res.json({
+      ok: true, loteId,
+      total: validos.length,
+      enviados: resultados.filter(r => r.ok).length,
+      erros: resultados.filter(r => !r.ok && !r.erro?.includes('demitido')).length,
+      demitidos: resultados.filter(r => r.erro?.includes('demitido')).length,
+      ignoradas,
+      sandbox: SANDBOX,
+      resultados,
+    })
+  } catch (err) {
+    console.error('[enviar-padrao]', err)
+    res.status(500).json({ erro: err.message })
+  } finally {
+    try { fs.unlinkSync(req.files?.pdf?.[0]?.path) } catch {}
+    try { fs.unlinkSync(req.files?.excel?.[0]?.path) } catch {}
+  }
+})
+
 app.listen(PORT, () => console.log(`OCR Service na porta ${PORT} | Sandbox: ${SANDBOX}`))
