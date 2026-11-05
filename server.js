@@ -64,6 +64,20 @@ app.use(async (req, res, next) => {
 app.use(express.json())
 app.get('/health', (req, res) => res.json({ ok: true, sandbox: SANDBOX }))
 
+// Matrícula: remove espaços e zeros à esquerda para casar OCR x Excel/RM (ex.: 000123 = 123)
+const normMat = m => String(m || '').trim().replace(/^0+/, '')
+
+function mapaDeLista(rows) {
+  const mapa = {}
+  rows.forEach(r => {
+    const chave = normMat(r.matricula)
+    if (chave && r.email && r.email.includes('@')) {
+      mapa[chave] = { nome: r.nome || '', email: r.email, cargo: '', matricula: r.matricula, centro_custo: r.centro_custo || '', situacao: String(r.situacao || 'ativo').toLowerCase() === 'demitido' ? 'demitido' : 'ativo' }
+    }
+  })
+  return mapa
+}
+
 function lerExcel(buffer) {
   const wb    = XLSX.read(buffer, { type: 'buffer' })
   const ws    = wb.Sheets[wb.SheetNames[0]]
@@ -76,10 +90,10 @@ function lerExcel(buffer) {
       const nk = normK(k).replace(/[\s-]+/g,'_')
       if (['nome','email','matricula','cpf','cargo','centro_custo','situacao'].includes(nk)) c[nk] = String(v).trim()
     }
-    const chave = c.matricula || c.cpf
+    const chave = normMat(c.matricula) || c.cpf
     if (chave && c.email && c.email.includes('@')) {
       const sit = String(c.situacao || 'ativo').toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g,'')
-      mapa[chave] = { nome: c.nome || '', email: c.email, cargo: c.cargo || '', centro_custo: c.centro_custo || '', situacao: /demit|inativ|desat/.test(sit) ? 'demitido' : 'ativo' }
+      mapa[chave] = { nome: c.nome || '', email: c.email, cargo: c.cargo || '', matricula: c.matricula || '', centro_custo: c.centro_custo || '', situacao: /demit|inativ|desat/.test(sit) ? 'demitido' : 'ativo' }
     }
   })
   return mapa
@@ -135,15 +149,17 @@ app.post('/processar', upload.fields([
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ocr_'))
   try {
     if (!req.files?.pdf)   return res.status(400).json({ erro: 'PDF obrigatório.' })
-    if (!req.files?.excel) return res.status(400).json({ erro: 'Planilha Excel obrigatória.' })
+    const fonteRM = req.body.fonte === 'rm'
+    if (!fonteRM && !req.files?.excel) return res.status(400).json({ erro: 'Planilha Excel obrigatória.' })
 
     const nomeDoc  = req.body.nomeDocumento || 'Contracheque'
     const mensagem = req.body.mensagem || ''
     const pdfPath  = req.files.pdf[0].path
 
-    const excelBuf      = fs.readFileSync(req.files.excel[0].path)
-    const colaboradores = lerExcel(excelBuf)
-    console.log(`[excel] ${Object.keys(colaboradores).length} colaboradores`)
+    const colaboradores = fonteRM
+      ? mapaDeLista(await consultarRM())
+      : lerExcel(fs.readFileSync(req.files.excel[0].path))
+    console.log(`[${fonteRM ? 'rm' : 'excel'}] ${Object.keys(colaboradores).length} colaboradores`)
 
     const { stdout: infoOut } = await execAsync(`pdfinfo "${pdfPath}"`)
     const pagesMatch   = infoOut.match(/Pages:\s+(\d+)/)
@@ -181,7 +197,7 @@ app.post('/processar', upload.fields([
 
     for (const item of itens) {
       try {
-        const dadosExcel = colaboradores[item.matricula]
+        const dadosExcel = colaboradores[normMat(item.matricula)]
         if (!dadosExcel) {
           resultados.push({ matricula: item.matricula, nome: item.nomeOCR, ok: false, erro: 'Matrícula não encontrada na planilha' })
           continue
@@ -213,7 +229,7 @@ app.post('/processar', upload.fields([
             lote_id:             loteId,
             nome:                dadosExcel.nome || item.nomeOCR,
             email:               dadosExcel.email,
-            matricula:           item.matricula,
+            matricula:           dadosExcel.matricula || item.matricula,
             cargo:               dadosExcel.cargo || '',
             centro_custo:        dadosExcel.centro_custo || null,
             situacao:            dadosExcel.situacao || 'ativo',
@@ -289,14 +305,27 @@ app.post('/enviar-padrao', upload.fields([
 ]), async (req, res) => {
   try {
     if (!req.files?.pdf)   return res.status(400).json({ erro: 'PDF obrigatório.' })
-    if (!req.files?.excel) return res.status(400).json({ erro: 'Planilha Excel obrigatória.' })
+    const fonteRM = req.body.fonte === 'rm'
+    if (!fonteRM && !req.files?.excel) return res.status(400).json({ erro: 'Planilha Excel obrigatória.' })
 
     const nomeDoc  = req.body.nomeDocumento || 'Documento para assinatura'
     const mensagem = req.body.mensagem || ''
     const pdfNome  = req.files.pdf[0].originalname || 'documento.pdf'
     const pdfBuf   = fs.readFileSync(req.files.pdf[0].path)
 
-    const todos = lerExcelLista(fs.readFileSync(req.files.excel[0].path))
+    let todos
+    if (fonteRM) {
+      const filtro = String(req.body.centroCusto || '').trim()
+      todos = (await consultarRM())
+        .filter(r => !filtro || String(r.centro_custo || '') === filtro)
+        .map(r => ({
+          nome: r.nome || '', email: r.email || '', matricula: r.matricula || '', cpf: '', cargo: '',
+          centro_custo: r.centro_custo || '', extras: {},
+          situacao: String(r.situacao || 'ativo').toLowerCase() === 'demitido' ? 'demitido' : 'ativo',
+        }))
+    } else {
+      todos = lerExcelLista(fs.readFileSync(req.files.excel[0].path))
+    }
     const validos = todos.filter(c => c.email && c.email.includes('@') && c.nome && c.matricula)
     const ignoradas = todos.length - validos.length
     if (!validos.length) {
