@@ -25,16 +25,40 @@ const SUPABASE_KEY     = process.env.SUPABASE_SERVICE_ROLE_KEY
 
 function sb() {
   return createClient(SUPABASE_URL, SUPABASE_KEY, {
-    global: { fetch: fetch },
+    global: { fetch },
     realtime: { transport: ws },
   })
 }
 
+const ORIGENS = (process.env.ALLOWED_ORIGINS || 'https://enviodocumentos.vercel.app').split(',').map(x => x.trim())
+
+// CORS: o navegador envia o PDF direto para cá (sem passar pelo Vercel, que limita a 4,5 MB)
 app.use((req, res, next) => {
-  if (req.path === '/health') return next()
-  const secret = req.headers['x-ocr-secret']
-  if (OCR_SECRET && secret !== OCR_SECRET) return res.status(401).json({ erro: 'Não autorizado.' })
+  const origin = req.headers.origin
+  if (origin && (ORIGENS.includes(origin) || ORIGENS.includes('*'))) {
+    res.setHeader('Access-Control-Allow-Origin', origin)
+    res.setHeader('Vary', 'Origin')
+    res.setHeader('Access-Control-Allow-Methods', 'POST, GET, OPTIONS')
+    res.setHeader('Access-Control-Allow-Headers', 'Authorization, Content-Type, x-ocr-secret')
+    res.setHeader('Access-Control-Max-Age', '86400')
+  }
+  if (req.method === 'OPTIONS') return res.sendStatus(204)
   next()
+})
+
+// Autenticação: segredo (servidor) OU token de login do Supabase (navegador)
+app.use(async (req, res, next) => {
+  if (req.path === '/health') return next()
+  if (OCR_SECRET && req.headers['x-ocr-secret'] === OCR_SECRET) return next()
+  const auth = req.headers.authorization || ''
+  const token = auth.startsWith('Bearer ') ? auth.slice(7) : ''
+  if (token) {
+    try {
+      const { data, error } = await sb().auth.getUser(token)
+      if (!error && data?.user) { req.user = data.user; return next() }
+    } catch (e) { console.error('[auth]', e.message) }
+  }
+  return res.status(401).json({ erro: 'Não autorizado. Faça login novamente.' })
 })
 
 app.use(express.json())
@@ -49,12 +73,13 @@ function lerExcel(buffer) {
   rows.forEach(row => {
     const c = {}
     for (const [k, v] of Object.entries(row)) {
-      const nk = normK(k)
-      if (['nome','email','matricula','cpf','cargo'].includes(nk)) c[nk] = String(v).trim()
+      const nk = normK(k).replace(/[\s-]+/g,'_')
+      if (['nome','email','matricula','cpf','cargo','centro_custo','situacao'].includes(nk)) c[nk] = String(v).trim()
     }
     const chave = c.matricula || c.cpf
     if (chave && c.email && c.email.includes('@')) {
-      mapa[chave] = { nome: c.nome || '', email: c.email, cargo: c.cargo || '' }
+      const sit = String(c.situacao || 'ativo').toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g,'')
+      mapa[chave] = { nome: c.nome || '', email: c.email, cargo: c.cargo || '', centro_custo: c.centro_custo || '', situacao: /demit|inativ|desat/.test(sit) ? 'demitido' : 'ativo' }
     }
   })
   return mapa
@@ -161,6 +186,10 @@ app.post('/processar', upload.fields([
           resultados.push({ matricula: item.matricula, nome: item.nomeOCR, ok: false, erro: 'Matrícula não encontrada na planilha' })
           continue
         }
+        if (dadosExcel.situacao === 'demitido') {
+          resultados.push({ matricula: item.matricula, nome: dadosExcel.nome || item.nomeOCR, ok: false, erro: 'Colaborador demitido — ignorado' })
+          continue
+        }
 
         const paginasStr   = item.paginas.join(' ')
         const pdfIndivPath = path.join(tmpDir, `${item.matricula}.pdf`)
@@ -186,6 +215,8 @@ app.post('/processar', upload.fields([
             email:               dadosExcel.email,
             matricula:           item.matricula,
             cargo:               dadosExcel.cargo || '',
+            centro_custo:        dadosExcel.centro_custo || null,
+            situacao:            dadosExcel.situacao || 'ativo',
             status:              'enviado',
             enviado_em:          new Date().toISOString(),
             document_id:         doc.id,
@@ -217,7 +248,7 @@ app.post('/processar', upload.fields([
       colaboradoresIdentificados: itens.length,
       enviados,
       semMatricula: resultados.filter(r => !r.ok && r.erro?.includes('não encontrada')).length,
-      erros:        resultados.filter(r => !r.ok && !r.erro?.includes('não encontrada')).length,
+      erros:        resultados.filter(r => !r.ok && !r.erro?.includes('não encontrada') && !r.erro?.includes('demitido')).length,
       sandbox:      SANDBOX,
       resultados,
     })
