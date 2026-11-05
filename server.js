@@ -142,6 +142,81 @@ async function criarDocumento({ nome, pdfBuf, pdfNome, email, nomeColaborador, m
   return json.data.createDocument
 }
 
+// ---------- IDENTIFICAÇÃO DE PÁGINAS (matrícula ou nome, em qualquer posição) ----------
+const RE_ACENTOS = new RegExp('[' + String.fromCharCode(768) + '-' + String.fromCharCode(879) + ']', 'g')
+const semAcento = s => String(s || '').normalize('NFD').replace(RE_ACENTOS, '').toUpperCase()
+// número de 3 a 8 dígitos que não seja parte de data (19/10/2026), valor (1.500,00) ou CPF/telefone
+const RE_NUM = /(?<![\d\/.,-])(\d{3,8})(?![\d\/]|[.,]\d|-\d)/g
+const numerosDoTexto = t => [...t.matchAll(RE_NUM)].map(m => m[1])
+
+function montarIndice(colaboradores) {
+  const entradas = Object.entries(colaboradores).map(([k, c]) => ({
+    k, toks: [...new Set(semAcento(c.nome).split(/[^A-Z0-9]+/).filter(x => x.length >= 2))],
+  })).filter(e => e.toks.length >= 2)
+  return {
+    porMat: colaboradores,
+    // pessoas cujo nome (todas as palavras) aparece na página
+    achaNomes(t) {
+      const palavras = new Set(t.split(/[^A-Z0-9]+/))
+      const achados = entradas.filter(e => e.toks.every(x => palavras.has(x)))
+      // descarta "ANA SOUSA" quando "ANA LIGIA SOUSA" também foi encontrado
+      return achados
+        .filter(a => !achados.some(b => b !== a && b.toks.length > a.toks.length && a.toks.every(x => b.toks.includes(x))))
+        .map(e => e.k)
+    },
+  }
+}
+
+// Devolve { tipo: 'ok' | 'conferir' | null, key, motivo, matLida }
+function identificarPagina(texto, indice) {
+  const t = semAcento(texto).replace(/[ \t]+/g, ' ')
+  const nomes = indice.achaNomes(t)
+
+  // 1) número logo depois do rótulo Matrícula / Chapa
+  let matLida = null
+  const rot = /(MATRICULA|CHAPA|\bMAT\b\.?)/g
+  let m
+  while ((m = rot.exec(t))) {
+    const ini = m.index + m[0].length
+    const nums = numerosDoTexto(t.slice(ini, ini + 160))
+    if (!nums.length) continue
+    const k = normMat(nums[0])
+    if (indice.porMat[k]) {
+      if (nomes.length && !nomes.includes(k)) {
+        return { tipo: 'conferir', key: k, motivo: 'A matrícula e o nome da página apontam para pessoas diferentes' }
+      }
+      return { tipo: 'ok', key: k }
+    }
+    matLida = matLida || nums[0]
+  }
+
+  // 2) números da página que são matrículas conhecidas
+  const conhecidos = [...new Set(numerosDoTexto(t).map(normMat).filter(k => indice.porMat[k]))]
+  if (conhecidos.length === 1) {
+    const k = conhecidos[0]
+    if (nomes.includes(k)) return { tipo: 'ok', key: k }
+    return { tipo: 'conferir', key: k, motivo: 'Matrícula encontrada sem rótulo e sem o nome na página' }
+  }
+  // 3) só o nome
+  if (nomes.length === 1) return { tipo: 'conferir', key: nomes[0], motivo: 'Identificado somente pelo nome' }
+  if (conhecidos.length > 1 || nomes.length > 1) {
+    return { tipo: 'conferir', key: null, motivo: 'Mais de uma pessoa possível nesta página' }
+  }
+  return { tipo: null, matLida }
+}
+
+async function textoDaPagina(pdfPath, pg) {
+  try {
+    const { stdout } = await execAsync(`pdftotext -f ${pg} -l ${pg} -layout "${pdfPath}" -`, { maxBuffer: 5 * 1024 * 1024 })
+    return stdout
+  } catch { return '' }
+}
+
+const resumoConferir = (lista, indice) => lista.map(c => ({
+  paginas: c.paginas, motivo: c.motivo,
+  sugestao: c.key && indice.porMat[c.key] ? { matricula: indice.porMat[c.key].matricula, nome: indice.porMat[c.key].nome } : null,
+}))
+
 app.post('/processar', upload.fields([
   { name: 'pdf',   maxCount: 1 },
   { name: 'excel', maxCount: 1 },
@@ -167,7 +242,13 @@ app.post('/processar', upload.fields([
     if (!totalPaginas) return res.status(400).json({ erro: 'Não foi possível ler o PDF.' })
 
     console.log(`[ocr] processando ${totalPaginas} páginas...`)
-    const mapa = {}
+    const indice = montarIndice(colaboradores)
+    const ocrPy = path.join(__dirname, 'ocr.py')
+    const grupos = {}
+    const conferir = []
+    const naoIdentificadas = []
+    let anterior = null
+    let anexadas = 0
 
     for (let pg = 1; pg <= totalPaginas; pg++) {
       const imgPrefix = path.join(tmpDir, 'pg')
@@ -175,22 +256,60 @@ app.post('/processar', upload.fields([
       const files = fs.readdirSync(tmpDir).filter(f => f.startsWith('pg') && f.endsWith('.jpg'))
       if (!files.length) continue
       const imgPath = path.join(tmpDir, files[0])
+      let id = null, matLida = null, nomeLido = ''
       try {
-        const { stdout } = await execAsync(`python3 ${path.join(__dirname, 'ocr.py')} "${imgPath}"`)
-        const output = stdout.trim()
-        if (output && output !== 'NAO_IDENTIFICADO' && output.includes('||')) {
-          const [matricula, nomeOCR] = output.split('||')
-          const chave = matricula.trim()
-          if (!mapa[chave]) mapa[chave] = { matricula: chave, nomeOCR: nomeOCR.trim(), paginas: [] }
-          mapa[chave].paginas.push(pg)
+        // 1) texto digital da página (PDF gerado por sistema)
+        const txt = await textoDaPagina(pdfPath, pg)
+        if (txt.replace(/\s/g, '').length >= 40) { id = identificarPagina(txt, indice); matLida = id.matLida || null }
+        // 2) OCR da faixa do topo (contracheque e fichas)
+        if (!id?.tipo) {
+          const { stdout } = await execAsync(`python3 ${ocrPy} "${imgPath}"`)
+          const out = stdout.trim()
+          if (out.includes('||')) {
+            const [mat, nome] = out.split('||')
+            nomeLido = (nome || '').trim()
+            if (indice.porMat[normMat(mat)]) id = { tipo: 'ok', key: normMat(mat) }
+            else matLida = matLida || mat.trim()
+          }
+        }
+        // 3) OCR da página inteira, procurando matrícula ou nome em qualquer posição
+        if (!id?.tipo) {
+          const { stdout } = await execAsync(`python3 ${ocrPy} "${imgPath}" --texto`, { maxBuffer: 5 * 1024 * 1024 })
+          id = identificarPagina(stdout, indice)
+          matLida = matLida || id.matLida || null
         }
       } catch (err) { console.error(`[ocr] erro página ${pg}:`, err.message) }
       try { fs.unlinkSync(imgPath) } catch {}
+
+      if (id?.tipo === 'ok') {
+        const g = grupos[id.key] || (grupos[id.key] = { matricula: id.key, nomeOCR: indice.porMat[id.key]?.nome || nomeLido, paginas: [] })
+        g.paginas.push(pg); anterior = g
+      } else if (id?.tipo === 'conferir') {
+        const c = { key: id.key, motivo: id.motivo, paginas: [pg] }
+        conferir.push(c); anterior = c
+      } else if (matLida) {
+        // matrícula lida, mas que não existe na lista: sai como "não encontrada"
+        const k = normMat(matLida)
+        const g = grupos[k] || (grupos[k] = { matricula: k, nomeOCR: nomeLido, paginas: [] })
+        g.paginas.push(pg); anterior = g
+      } else if (anterior) {
+        // página sem identificação: continuação do documento anterior
+        anterior.paginas.push(pg); anexadas++
+      } else {
+        naoIdentificadas.push(pg)
+      }
     }
 
-    const itens = Object.values(mapa)
-    console.log(`[ocr] ${itens.length} identificados`)
-    if (!itens.length) return res.status(400).json({ erro: 'Nenhum colaborador identificado pelo OCR.' })
+    const itens = Object.values(grupos)
+    console.log(`[ocr] ${itens.length} identificados, ${conferir.length} para conferir, ${naoIdentificadas.length} sem identificação, ${anexadas} páginas anexadas`)
+    if (!itens.length) {
+      return res.status(400).json({
+        erro: conferir.length
+          ? `Nenhuma página foi identificada com segurança; ${conferir.length} ficaram para conferir.`
+          : 'Nenhum colaborador identificado pelo OCR.',
+        paraConferir: resumoConferir(conferir, indice), naoIdentificadas,
+      })
+    }
 
     const loteId     = 'lote_ocr_' + Date.now()
     const resultados = []
@@ -262,6 +381,9 @@ app.post('/processar', upload.fields([
     res.json({
       ok: true, loteId, totalPaginas,
       colaboradoresIdentificados: itens.length,
+      paraConferir: resumoConferir(conferir, indice),
+      naoIdentificadas,
+      paginasAnexadas: anexadas,
       enviados,
       semMatricula: resultados.filter(r => !r.ok && r.erro?.includes('não encontrada')).length,
       erros:        resultados.filter(r => !r.ok && !r.erro?.includes('não encontrada') && !r.erro?.includes('demitido')).length,
