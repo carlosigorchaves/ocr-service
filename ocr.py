@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-import sys, re, pytesseract
+import sys, re, os, pytesseract
 from PIL import Image
 
 LETRA = r'A-ZÁÉÍÓÚÀÃÕÂÊÎÔÛÇ'
 # número que não faz parte de uma data (ex.: 19/10/2026)
-NUM = r'(?<![\d/])(\d{3,6})(?![\d/])'
+_D = os.environ.get('MAT_DIGITOS', '')   # tamanho da matrícula da empresa (vem do servidor)
+NUM = r'(?<![\d/])(\d{' + (_D if _D.isdigit() and int(_D) > 0 else '3,6') + r'})(?![\d/])'
 
 
 def ocr(img, lang):
