@@ -147,7 +147,9 @@ const RE_ACENTOS = new RegExp('[' + String.fromCharCode(768) + '-' + String.from
 const semAcento = s => String(s || '').normalize('NFD').replace(RE_ACENTOS, '').toUpperCase()
 // número de 3 a 8 dígitos que não seja parte de data (19/10/2026), valor (1.500,00) ou CPF/telefone
 const RE_NUM = /(?<![\d\/.,-])(\d{3,8})(?![\d\/]|[.,]\d|-\d)/g
-const numerosDoTexto = t => [...t.matchAll(RE_NUM)].map(m => m[1])
+let MAT_DIGITOS = 0   // tamanho da matrícula da empresa (tabela empresas_config); 0 = qualquer tamanho de 3 a 8
+const reNum = () => MAT_DIGITOS ? new RegExp('(?<![\\d\\/.,-])(\\d{' + MAT_DIGITOS + '})(?![\\d\\/]|[.,]\\d|-\\d)', 'g') : RE_NUM
+const numerosDoTexto = t => [...t.matchAll(reNum())].map(m => m[1])
 
 function montarIndice(colaboradores) {
   const entradas = Object.entries(colaboradores).map(([k, c]) => ({
@@ -809,3 +811,15 @@ app.post('/enviar-paginas', upload.fields([
     try { fs.unlinkSync(req.files?.excel?.[0]?.path) } catch {}
   }
 })
+
+// tamanho da matrícula por empresa (empresas_config.matricula_digitos); recarrega a cada 5 min
+async function carregarConfigEmpresa() {
+  try {
+    const { data } = await sb().from('empresas_config').select('matricula_digitos').eq('empresa', EMPRESA).maybeSingle()
+    const n = data?.matricula_digitos
+    MAT_DIGITOS = Number.isInteger(n) && n > 0 ? n : 0
+    process.env.MAT_DIGITOS = String(MAT_DIGITOS)   // o ocr.py lê daqui
+  } catch {}
+}
+carregarConfigEmpresa()
+setInterval(carregarConfigEmpresa, 5 * 60 * 1000)
