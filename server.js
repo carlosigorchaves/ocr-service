@@ -358,4 +358,134 @@ app.post('/enviar-padrao', upload.fields([
   }
 })
 
+// ---------- INTEGRACAO TOTVS RM (webservice wsConsultaSQL) ----------
+const RM_URL      = process.env.RM_URL
+const RM_USER     = process.env.RM_USER
+const RM_PASSWORD = process.env.RM_PASSWORD
+const RM_COLIGADA = process.env.RM_COLIGADA || '1'
+const RM_CONSULTA = process.env.RM_CONSULTA
+
+function xmlUnescape(t) {
+  return t.split('&lt;').join('<').split('&gt;').join('>').split('&quot;').join('"').split('&apos;').join("'").split('&amp;').join('&')
+}
+
+function parseResultado(xml) {
+  const rows = []
+  let pos = 0
+  while (true) {
+    const a = xml.indexOf('<Resultado>', pos)
+    if (a < 0) break
+    const b = xml.indexOf('</Resultado>', a)
+    if (b < 0) break
+    const chunk = xml.slice(a + 11, b)
+    const row = {}
+    let p = 0
+    while (true) {
+      const st = chunk.indexOf('<', p)
+      if (st < 0) break
+      const en = chunk.indexOf('>', st)
+      if (en < 0) break
+      const tag = chunk.slice(st + 1, en)
+      if (tag.startsWith('/')) { p = en + 1; continue }
+      if (tag.endsWith('/')) { row[tag.slice(0, -1).toLowerCase()] = ''; p = en + 1; continue }
+      const close = chunk.indexOf('</' + tag + '>', en)
+      if (close < 0) break
+      row[tag.toLowerCase()] = xmlUnescape(chunk.slice(en + 1, close)).trim()
+      p = close + tag.length + 3
+    }
+    rows.push(row)
+    pos = b + 12
+  }
+  return rows
+}
+
+function consultarRM() {
+  return new Promise((resolve, reject) => {
+    if (!RM_URL || !RM_USER || !RM_PASSWORD || !RM_CONSULTA ||
+        [RM_USER, RM_PASSWORD, RM_CONSULTA].includes('PREENCHER')) {
+      return reject(new Error('Variáveis do RM não configuradas no Railway (RM_URL, RM_USER, RM_PASSWORD, RM_CONSULTA).'))
+    }
+    const envelope =
+      '<soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/" xmlns:tot="http://www.totvs.com/">' +
+      '<soapenv:Header/><soapenv:Body><tot:RealizarConsultaSQL>' +
+      `<tot:codSentenca>${RM_CONSULTA}</tot:codSentenca>` +
+      `<tot:codColigada>${RM_COLIGADA}</tot:codColigada>` +
+      '<tot:codSistema>P</tot:codSistema>' +
+      `<tot:parameters>CODCOLIGADA=${RM_COLIGADA}</tot:parameters>` +
+      '</tot:RealizarConsultaSQL></soapenv:Body></soapenv:Envelope>'
+    const auth = Buffer.from(`${RM_USER}:${RM_PASSWORD}`).toString('base64')
+    const req = https.request(RM_URL, {
+      method: 'POST',
+      timeout: 60000,
+      headers: {
+        'Content-Type': 'text/xml; charset=utf-8',
+        'SOAPAction': 'http://www.totvs.com/IwsConsultaSQL/RealizarConsultaSQL',
+        'Authorization': `Basic ${auth}`,
+        'Content-Length': Buffer.byteLength(envelope),
+      },
+    }, res => {
+      let data = ''
+      res.setEncoding('utf8')
+      res.on('data', c => data += c)
+      res.on('end', () => {
+        if (res.statusCode === 401) return reject(new Error('RM recusou o usuário ou a senha (HTTP 401).'))
+        if (data.includes('faultstring') || data.includes(':Fault>')) {
+          const i = data.indexOf('faultstring')
+          const msg = i >= 0 ? data.slice(data.indexOf('>', i) + 1, data.indexOf('<', data.indexOf('>', i) + 1)) : 'erro SOAP'
+          return reject(new Error('RM devolveu erro: ' + xmlUnescape(msg).slice(0, 300)))
+        }
+        const st = data.indexOf('<RealizarConsultaSQLResult')
+        const en = data.indexOf('</RealizarConsultaSQLResult>')
+        if (st < 0 || en < 0) return reject(new Error(`Resposta inesperada do RM (HTTP ${res.statusCode}).`))
+        const inner = data.slice(data.indexOf('>', st) + 1, en)
+        const xml = xmlUnescape(inner)
+        const rows = parseResultado(xml)
+        if (!rows.length && xml.trim() && !xml.includes('<NewDataSet')) {
+          return reject(new Error('RM respondeu: ' + xml.trim().slice(0, 300)))
+        }
+        resolve(rows)
+      })
+    })
+    req.on('timeout', () => req.destroy(new Error('Tempo esgotado ao falar com o RM (possível bloqueio de rede/geolocalização).')))
+    req.on('error', e => reject(new Error('Falha ao conectar no RM: ' + e.message)))
+    req.write(envelope)
+    req.end()
+  })
+}
+
+// Teste: devolve só contagem e nomes de colunas (nenhum dado pessoal)
+app.get('/rm/testar', async (req, res) => {
+  try {
+    const rows = await consultarRM()
+    const colunas = rows.length ? Object.keys(rows[0]) : []
+    const esperadas = ['matricula', 'nome', 'email', 'centro_custo', 'situacao']
+    const comEmail = rows.filter(r => r.email && r.email.includes('@')).length
+    const demitidos = rows.filter(r => String(r.situacao || '').toLowerCase() === 'demitido').length
+    res.json({
+      ok: true, linhas: rows.length, colunas,
+      faltando: esperadas.filter(c => !colunas.includes(c)),
+      comEmailValido: comEmail, demitidos,
+    })
+  } catch (err) {
+    console.error('[rm/testar]', err.message)
+    res.status(502).json({ erro: err.message })
+  }
+})
+
+// Lista normalizada para a tela "Buscar do RM"
+app.get('/rm/colaboradores', async (req, res) => {
+  try {
+    const rows = await consultarRM()
+    const lista = rows.map(r => ({
+      nome: r.nome || '', email: r.email || '', matricula: r.matricula || '',
+      centro_custo: r.centro_custo || '',
+      situacao: String(r.situacao || 'ativo').toLowerCase() === 'demitido' ? 'demitido' : 'ativo',
+    }))
+    res.json({ ok: true, total: lista.length, colaboradores: lista })
+  } catch (err) {
+    console.error('[rm/colaboradores]', err.message)
+    res.status(502).json({ erro: err.message })
+  }
+})
+
 app.listen(PORT, () => console.log(`OCR Service na porta ${PORT} | Sandbox: ${SANDBOX}`))
