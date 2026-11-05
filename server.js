@@ -157,7 +157,7 @@ app.post('/processar', upload.fields([
     const pdfPath  = req.files.pdf[0].path
 
     const colaboradores = fonteRM
-      ? mapaDeLista(await consultarRM())
+      ? mapaDeLista(await carregarFuncionarios())
       : lerExcel(fs.readFileSync(req.files.excel[0].path))
     console.log(`[${fonteRM ? 'rm' : 'excel'}] ${Object.keys(colaboradores).length} colaboradores`)
 
@@ -316,7 +316,7 @@ app.post('/enviar-padrao', upload.fields([
     let todos
     if (fonteRM) {
       const filtro = String(req.body.centroCusto || '').trim()
-      todos = (await consultarRM())
+      todos = (await carregarFuncionarios())
         .filter(r => !filtro || String(r.centro_custo || '') === filtro)
         .map(r => ({
           nome: r.nome || '', email: r.email || '', matricula: r.matricula || '', cpf: '', cargo: '',
@@ -501,10 +501,102 @@ app.get('/rm/testar', async (req, res) => {
   }
 })
 
-// Lista normalizada para a tela "Buscar do RM"
+// ── Cadastro local (tabela funcionarios): carga inicial + atualizações do RM ──
+// Empresa dona do cadastro/RM desta instalação (outros clientes terão outro valor)
+const EMPRESA = process.env.RM_EMPRESA || 'instituto-se-liga'
+const normSit = s => String(s || 'ativo').toLowerCase() === 'demitido' ? 'demitido' : 'ativo'
+
+async function lerCadastro() {
+  const out = []
+  for (let from = 0; ; from += 1000) {
+    const { data, error } = await sb().from('funcionarios')
+      .select('matricula,nome,email,centro_custo,situacao').eq('empresa', EMPRESA).order('matricula').range(from, from + 999)
+    if (error) throw new Error('Cadastro: ' + error.message)
+    out.push(...data)
+    if (data.length < 1000) break
+  }
+  return out
+}
+
+// Usa o cadastro local; se ainda estiver vazio (sem carga inicial), consulta o RM direto.
+async function carregarFuncionarios() {
+  const cad = await lerCadastro()
+  return cad.length ? cad : await consultarRM()
+}
+
+let sincronizando = false
+async function sincronizarRM() {
+  if (sincronizando) throw new Error('Já existe uma sincronização em andamento.')
+  sincronizando = true
+  try {
+    const rm = await consultarRM()
+    const novo = new Map()
+    for (const r of rm) {
+      const mat = normMat(r.matricula)
+      if (!mat || !r.nome) continue
+      novo.set(mat, {
+        empresa: EMPRESA, matricula: mat, nome: String(r.nome).trim(), email: String(r.email || '').trim().toLowerCase(),
+        centro_custo: String(r.centro_custo || '').trim(), situacao: normSit(r.situacao),
+      })
+    }
+    if (!novo.size) throw new Error('O RM não retornou funcionários; cadastro mantido sem alterações.')
+
+    const atual = new Map((await lerCadastro()).map(f => [f.matricula, f]))
+    const mudou = (a, b) => a.nome !== b.nome || (a.email || '') !== b.email ||
+      (a.centro_custo || '') !== b.centro_custo || a.situacao !== b.situacao
+
+    const gravar = []
+    let novos = 0, atualizados = 0, inalterados = 0
+    for (const [mat, f] of novo) {
+      const a = atual.get(mat)
+      if (!a) { novos++; gravar.push(f) }
+      else if (mudou(a, f)) { atualizados++; gravar.push(f) }
+      else inalterados++
+    }
+    const agora = new Date().toISOString()
+    for (let i = 0; i < gravar.length; i += 500) {
+      const lote = gravar.slice(i, i + 500).map(f => ({ ...f, origem: 'rm', sincronizado_em: agora, updated_at: agora }))
+      const { error } = await sb().from('funcionarios').upsert(lote, { onConflict: 'empresa,matricula' })
+      if (error) throw new Error('Gravação: ' + error.message)
+    }
+    // quem sumiu do RM e ainda está ativo no cadastro é marcado como demitido (nada é apagado)
+    const sumiu = [...atual.values()].filter(a => !novo.has(a.matricula) && a.situacao !== 'demitido').map(a => a.matricula)
+    for (let i = 0; i < sumiu.length; i += 200) {
+      const { error } = await sb().from('funcionarios')
+        .update({ situacao: 'demitido', updated_at: agora, sincronizado_em: agora }).eq('empresa', EMPRESA).in('matricula', sumiu.slice(i, i + 200))
+      if (error) throw new Error('Baixa: ' + error.message)
+    }
+    const resumo = { empresa: EMPRESA, total: novo.size, novos, atualizados, inalterados, removidos: sumiu.length }
+    await sb().from('sincronizacoes_rm').insert(resumo)
+    return resumo
+  } catch (err) {
+    try { await sb().from('sincronizacoes_rm').insert({ empresa: EMPRESA, erro: err.message }) } catch {}
+    throw err
+  } finally {
+    sincronizando = false
+  }
+}
+
+app.post('/rm/sincronizar', async (req, res) => {
+  try {
+    const resumo = await sincronizarRM()
+    console.log('[rm/sincronizar]', JSON.stringify(resumo))
+    res.json({ ok: true, ...resumo })
+  } catch (err) {
+    console.error('[rm/sincronizar]', err.message)
+    res.status(502).json({ erro: err.message })
+  }
+})
+
+app.get('/rm/ultima-sincronizacao', async (req, res) => {
+  const { data } = await sb().from('sincronizacoes_rm').select('*').eq('empresa', EMPRESA).order('id', { ascending: false }).limit(1)
+  res.json({ ok: true, ultima: data?.[0] || null })
+})
+
+// Lista normalizada para a tela "Buscar do RM" (lê do cadastro local)
 app.get('/rm/colaboradores', async (req, res) => {
   try {
-    const rows = await consultarRM()
+    const rows = await carregarFuncionarios()
     const lista = rows.map(r => ({
       nome: r.nome || '', email: r.email || '', matricula: r.matricula || '',
       centro_custo: r.centro_custo || '',
