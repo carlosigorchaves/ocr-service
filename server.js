@@ -732,3 +732,80 @@ app.get('/rm/colaboradores', async (req, res) => {
 })
 
 app.listen(PORT, () => console.log(`OCR Service na porta ${PORT} | Sandbox: ${SANDBOX}`))
+
+// ---------- CONFIRMAÇÃO MANUAL: envia páginas que o OCR deixou "para conferir" ----------
+app.post('/enviar-paginas', upload.fields([
+  { name: 'pdf',   maxCount: 1 },
+  { name: 'excel', maxCount: 1 },
+]), async (req, res) => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'conf_'))
+  try {
+    if (!req.files?.pdf) return res.status(400).json({ erro: 'PDF obrigatório.' })
+    const fonteRM = req.body.fonte === 'rm'
+    if (!fonteRM && !req.files?.excel) return res.status(400).json({ erro: 'Planilha Excel obrigatória.' })
+    let confirmacoes
+    try { confirmacoes = JSON.parse(req.body.confirmacoes || '[]') }
+    catch { return res.status(400).json({ erro: 'Confirmações inválidas.' }) }
+    if (!Array.isArray(confirmacoes) || !confirmacoes.length) return res.status(400).json({ erro: 'Nenhuma página confirmada.' })
+
+    const nomeDoc  = req.body.nomeDocumento || 'Documento'
+    const mensagem = req.body.mensagem || ''
+    const pdfPath  = req.files.pdf[0].path
+    const colaboradores = fonteRM
+      ? mapaDeLista(await carregarFuncionarios())
+      : lerExcel(fs.readFileSync(req.files.excel[0].path))
+
+    const { stdout: infoOut } = await execAsync(`pdfinfo "${pdfPath}"`)
+    const total = parseInt((infoOut.match(/Pages:\s+(\d+)/) || [])[1] || '0')
+    const loteId = 'lote_conf_' + Date.now()
+    const resultados = []
+
+    for (let i = 0; i < confirmacoes.length; i++) {
+      const c = confirmacoes[i]
+      const paginas = [...new Set((c.paginas || []).map(Number))].filter(n => Number.isInteger(n) && n >= 1 && n <= total).sort((a, b) => a - b)
+      const dados = colaboradores[normMat(c.matricula)]
+      if (!paginas.length || !dados) {
+        resultados.push({ matricula: c.matricula, ok: false, erro: 'Matrícula não encontrada na planilha' })
+        continue
+      }
+      if (dados.situacao === 'demitido') {
+        resultados.push({ matricula: c.matricula, nome: dados.nome, ok: false, erro: 'Colaborador demitido — ignorado' })
+        continue
+      }
+      try {
+        const pdfIndiv = path.join(tmpDir, `conf_${i}.pdf`)
+        await execAsync(`pdftk "${pdfPath}" cat ${paginas.join(' ')} output "${pdfIndiv}"`)
+        const doc = await criarDocumento({
+          nome: `${nomeDoc} - ${dados.nome}`, pdfBuf: fs.readFileSync(pdfIndiv), pdfNome: `${normMat(c.matricula)}.pdf`,
+          email: dados.email, nomeColaborador: dados.nome, mensagem,
+        })
+        const sig = doc.signatures?.[0]
+        await sb().from('colaboradores').insert({
+          lote_id: loteId, nome: dados.nome, email: dados.email, matricula: dados.matricula || normMat(c.matricula),
+          cargo: dados.cargo || '', centro_custo: dados.centro_custo || null, situacao: dados.situacao || 'ativo',
+          status: 'enviado', enviado_em: new Date().toISOString(), document_id: doc.id,
+          signature_public_id: sig?.public_id || null, link_assinatura: sig?.link?.short_link || null,
+        })
+        resultados.push({ matricula: c.matricula, nome: dados.nome, email: dados.email, ok: true, documentId: doc.id })
+        console.log(`[conferido ok] ${dados.nome} <${dados.email}> págs ${paginas.join(',')}`)
+        if (i < confirmacoes.length - 1) await new Promise(r => setTimeout(r, 1100))
+      } catch (err) {
+        console.error(`[conferido erro] ${c.matricula}: ${err.message}`)
+        resultados.push({ matricula: c.matricula, nome: dados.nome, ok: false, erro: err.message })
+      }
+    }
+    res.json({
+      ok: true, loteId,
+      enviados: resultados.filter(r => r.ok).length,
+      erros: resultados.filter(r => !r.ok).length,
+      sandbox: SANDBOX, resultados,
+    })
+  } catch (err) {
+    console.error('[enviar-paginas]', err)
+    res.status(500).json({ erro: err.message })
+  } finally {
+    try { fs.rmSync(tmpDir, { recursive: true }) } catch {}
+    try { fs.unlinkSync(req.files?.pdf?.[0]?.path) } catch {}
+    try { fs.unlinkSync(req.files?.excel?.[0]?.path) } catch {}
+  }
+})
