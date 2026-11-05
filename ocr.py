@@ -59,4 +59,8 @@ if __name__ == '__main__':
     if len(sys.argv) < 2:
         print("NAO_IDENTIFICADO")
         sys.exit(1)
-    extrair(sys.argv[1])
+    if '--texto' in sys.argv:
+        # texto da página inteira (a identificação é feita pelo servidor)
+        print(ocr(Image.open(sys.argv[1]), 'por'))
+    else:
+        extrair(sys.argv[1])
